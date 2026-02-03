@@ -1,4 +1,4 @@
-Another of [“Recursive Self-Aggregation Unlocks Deep Thinking in Large Language Models.”](https://rsa-llm.github.io/) with DSPy.
+[“Recursive Self-Aggregation Unlocks Deep Thinking in Large Language Models.”](https://rsa-llm.github.io/) implemented with DSPy.
 
 ## Setup
 
@@ -38,6 +38,7 @@ uvx --from git+https://github.com/eaubin/recselfagg recselfagg \
 - `--debug`: print rollout ids and debug info for each call
 - `--trace-json`: write JSON trace of populations at each step to a file
 - `--final-population-file`: write final population (JSON) to a file
+- `--parallel`: number of concurrent model calls (default: 1)
 
 ### Output
 

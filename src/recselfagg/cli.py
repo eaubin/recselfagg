@@ -80,6 +80,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Enable DSPy LM cache (disabled by default).",
     )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        help="Number of concurrent model calls (default: 1).",
+    )
     return parser.parse_args(argv)
 
 
@@ -97,6 +103,46 @@ def main(argv: list[str] | None = None) -> int:
     if not prompt:
         raise SystemExit("Prompt is empty.")
 
+    def progress_cb(event: dict) -> None:
+        if args.no_progress:
+            return
+        event_type = event.get("type")
+        if event_type == "init":
+            print(
+                f"Initialized population: {len(event['population'])}",
+                file=sys.stderr,
+            )
+        elif event_type == "step":
+            _print_progress(event["cost"], event["step"], args.steps)
+        elif event_type == "early_stop":
+            print(
+                "Stopping early: population smaller than subset "
+                f"({len(event['population'])} < {args.subset}).",
+                file=sys.stderr,
+            )
+
+    def completion_cb(event: dict) -> None:
+        if not (args.show_completions and args.debug):
+            return
+        phase = event.get("phase")
+        if phase == "population":
+            header = "Initial Completion"
+            idx = event["index"]
+            total = event["target"]
+        else:
+            header = f"Step {event['step']} Completion"
+            idx = event["index"]
+            total = event["target"]
+        sample = event["sample"]
+        print(
+            f"\n=== {header} {idx}/{total} ===",
+            file=sys.stderr,
+        )
+        print("Reasoning:", file=sys.stderr)
+        print(sample.reasoning.strip(), file=sys.stderr)
+        print("\nAnswer:", file=sys.stderr)
+        print(sample.answer.strip(), file=sys.stderr)
+
     config = RSAConfig(
         prompt=prompt,
         model=args.model,
@@ -111,37 +157,19 @@ def main(argv: list[str] | None = None) -> int:
         rollout_base=args.rollout_base,
         debug=args.debug,
         cache=args.cache,
+        parallel=args.parallel,
+        progress_cb=progress_cb,
+        completion_cb=completion_cb,
     )
 
     result = run_rsa(config)
 
-    if not args.no_progress:
-        print(f"Initialized population: {len(result.trace[0]['population'])}", file=sys.stderr)
-        for step in result.trace[1:]:
-            _print_progress(step["cost"], step["step"], args.steps)
-
-    if args.show_completions:
-        for step in result.trace:
-            if step["step"] == 0:
-                header = "Initial Completion"
-            else:
-                header = f"Step {step['step']} Completion"
-            for idx, sample in enumerate(step["population"], 1):
-                print(
-                    f"\n=== {header} {idx}/{len(step['population'])} ===",
-                    file=sys.stderr,
-                )
-                print("Reasoning:", file=sys.stderr)
-                print(sample.get("reasoning", "").strip(), file=sys.stderr)
-                print("\nAnswer:", file=sys.stderr)
-                print(sample.get("answer", "").strip(), file=sys.stderr)
-
-    if args.debug:
-        print("\n=== Cost Summary ===", file=sys.stderr)
-        print(f"Total cost (USD): ${result.total_cost:.6f}", file=sys.stderr)
     if args.debug:
         print("\n=== Final Answer ===", file=sys.stderr)
     print(result.answer)
+    if args.debug:
+        print("\n=== Cost Summary ===", file=sys.stderr)
+        print(f"Total cost (USD): ${result.total_cost:.6f}", file=sys.stderr)
 
     if args.trace_json:
         write_trace_json(

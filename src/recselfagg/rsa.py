@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import dspy
 
@@ -101,6 +102,9 @@ class RSAConfig:
     rollout_base: Optional[int] = None
     debug: bool = False
     cache: bool = False
+    parallel: int = 1
+    progress_cb: Optional[Callable[[dict], None]] = None
+    completion_cb: Optional[Callable[[dict], None]] = None
 
 
 @dataclass
@@ -152,87 +156,164 @@ def run_rsa(config: RSAConfig) -> RSAResult:
     population_predictor = dspy.ChainOfThought(RSAPopulation)
     aggregate_predictor = dspy.ChainOfThought(RSAggregate)
     population_instruction = (
-        "Solve the problem directly. Provide only the final answer."
+        "Solve the problem step by step. Provide your reasoning and the final answer."
     )
     aggregate_instruction = (
-        "You are given a problem and candidate solutions. "
+        "You are given a problem and candidate solutions with reasoning. "
         "Some candidates may be incorrect or incomplete. "
-        "Aggregate the useful ideas, resolve disagreements, and produce a single "
-        "high-quality final answer. If all candidates are wrong, solve the problem "
-        "from scratch. Provide only the final answer."
+        "Aggregate the useful ideas and intermediate steps, resolve disagreements, "
+        "and produce a single high-quality solution with reasoning and a final answer. "
+        "If all candidates are wrong, solve the problem from scratch."
     )
 
     max_attempts = max(config.population * 5, config.population + 5)
     attempts = 0
-    while len(population) < config.population and attempts < max_attempts:
-        attempts += 1
-        if config.debug:
-            print(f"[debug] population rollout_id={rollout_id}")
-        result = population_predictor(
-            instruction=population_instruction,
-            problem=prompt,
-            temperature=population_temperature,
-            max_tokens=config.max_tokens,
-            rollout_id=rollout_id,
-        )
-        sample = RSASample(
-            reasoning=(getattr(result, "reasoning", "") or "").strip(),
-            answer=(result.answer or "").strip(),
-        )
-        if sample.answer and sample.answer not in population_set:
-            population.append(sample)
-            population_set.add(sample.answer)
-        rollout_id += 1
-
-    if not population:
-        raise RuntimeError("Population is empty. Try higher temperature or a new prompt.")
-
-    trace_steps.append(
-        {
-            "step": 0,
-            "population": [sample.__dict__ for sample in population],
-            "cost": total_cost_usd(lm),
-        }
-    )
-
-    for step in range(1, config.steps + 1):
-        if len(population) < config.subset:
-            if config.debug:
-                print(
-                    "Stopping early: population smaller than subset "
-                    f"({len(population)} < {config.subset})."
+    parallel = max(1, config.parallel)
+    executor = ThreadPoolExecutor(max_workers=parallel)
+    try:
+        while len(population) < config.population and attempts < max_attempts:
+            remaining = max_attempts - attempts
+            batch = min(parallel, remaining)
+            futures = []
+            for _ in range(batch):
+                if config.debug:
+                    print(f"[debug] population rollout_id={rollout_id}")
+                rid = rollout_id
+                rollout_id += 1
+                attempts += 1
+                futures.append(
+                    executor.submit(
+                        population_predictor,
+                        instruction=population_instruction,
+                        problem=prompt,
+                        temperature=population_temperature,
+                        max_tokens=config.max_tokens,
+                        rollout_id=rid,
+                    )
                 )
-            break
-        new_population: List[RSASample] = []
-        new_population_set = set()
-        attempts = 0
-        while len(new_population) < config.population and attempts < max_attempts:
-            attempts += 1
-            subset = random.sample(population, config.subset)
-            if config.debug:
-                print(f"[debug] aggregate rollout_id={rollout_id}")
-            candidate = _call_predict(
-                aggregate_predictor,
-                instruction=aggregate_instruction,
-                problem=prompt,
-                candidates=subset,
-                temperature=aggregate_temperature,
-                max_tokens=config.max_tokens,
-                rollout_id=rollout_id,
+            for future in as_completed(futures):
+                result = future.result()
+                sample = RSASample(
+                    reasoning=(getattr(result, "reasoning", "") or "").strip(),
+                    answer=(result.answer or "").strip(),
+                )
+                if sample.answer and sample.answer not in population_set:
+                    population.append(sample)
+                    population_set.add(sample.answer)
+                    if config.completion_cb:
+                        config.completion_cb(
+                            {
+                                "phase": "population",
+                                "index": len(population),
+                                "target": config.population,
+                                "sample": sample,
+                            }
+                        )
+                if len(population) >= config.population:
+                    break
+
+        if not population:
+            raise RuntimeError(
+                "Population is empty. Try higher temperature or a new prompt."
             )
-            if candidate.answer and candidate.answer not in new_population_set:
-                new_population.append(candidate)
-                new_population_set.add(candidate.answer)
-            rollout_id += 1
-        population = new_population
-        population_set = new_population_set
+
+        if config.progress_cb:
+            config.progress_cb(
+                {
+                    "type": "init",
+                    "population": population,
+                    "cost": total_cost_usd(lm),
+                }
+            )
+
         trace_steps.append(
             {
-                "step": step,
+                "step": 0,
                 "population": [sample.__dict__ for sample in population],
                 "cost": total_cost_usd(lm),
             }
         )
+
+        for step in range(1, config.steps + 1):
+            if len(population) < config.subset:
+                if config.debug:
+                    print(
+                        "Stopping early: population smaller than subset "
+                        f"({len(population)} < {config.subset})."
+                    )
+                if config.progress_cb:
+                    config.progress_cb(
+                        {
+                            "type": "early_stop",
+                            "step": step,
+                            "population": population,
+                            "cost": total_cost_usd(lm),
+                        }
+                    )
+                break
+            new_population: List[RSASample] = []
+            new_population_set = set()
+            attempts = 0
+            while len(new_population) < config.population and attempts < max_attempts:
+                remaining = max_attempts - attempts
+                batch = min(parallel, remaining)
+                futures = []
+                for _ in range(batch):
+                    subset = random.sample(population, config.subset)
+                    if config.debug:
+                        print(f"[debug] aggregate rollout_id={rollout_id}")
+                    rid = rollout_id
+                    rollout_id += 1
+                    attempts += 1
+                    futures.append(
+                        executor.submit(
+                            _call_predict,
+                            aggregate_predictor,
+                            instruction=aggregate_instruction,
+                            problem=prompt,
+                            candidates=subset,
+                            temperature=aggregate_temperature,
+                            max_tokens=config.max_tokens,
+                            rollout_id=rid,
+                        )
+                    )
+                for future in as_completed(futures):
+                    candidate = future.result()
+                    if candidate.answer and candidate.answer not in new_population_set:
+                        new_population.append(candidate)
+                        new_population_set.add(candidate.answer)
+                        if config.completion_cb:
+                            config.completion_cb(
+                                {
+                                    "phase": "aggregate",
+                                    "step": step,
+                                    "index": len(new_population),
+                                    "target": config.population,
+                                    "sample": candidate,
+                                }
+                            )
+                    if len(new_population) >= config.population:
+                        break
+            population = new_population
+            population_set = new_population_set
+            if config.progress_cb:
+                config.progress_cb(
+                    {
+                        "type": "step",
+                        "step": step,
+                        "population": population,
+                        "cost": total_cost_usd(lm),
+                    }
+                )
+            trace_steps.append(
+                {
+                    "step": step,
+                    "population": [sample.__dict__ for sample in population],
+                    "cost": total_cost_usd(lm),
+                }
+            )
+    finally:
+        executor.shutdown(wait=True)
 
     final_sample = random.choice(population)
     total_cost = total_cost_usd(lm)
