@@ -120,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         for step in result.trace[1:]:
             _print_progress(step["cost"], step["step"], args.steps)
 
-    if args.show_completions and args.debug:
+    if args.show_completions:
         for step in result.trace:
             if step["step"] == 0:
                 header = "Initial Completion"
@@ -137,11 +137,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(sample.get("answer", "").strip(), file=sys.stderr)
 
     if args.debug:
-        print("\n=== Final Answer ===", file=sys.stderr)
-    print(result.answer)
-    if args.debug:
         print("\n=== Cost Summary ===", file=sys.stderr)
         print(f"Total cost (USD): ${result.total_cost:.6f}", file=sys.stderr)
+    if args.debug:
+        print("\n=== Final Answer ===", file=sys.stderr)
+    print(result.answer)
 
     if args.trace_json:
         write_trace_json(
