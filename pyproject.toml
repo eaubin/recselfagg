@@ -1,0 +1,15 @@
+[project]
+name = "recselfagg"
+version = "0.1.0"
+description = "Recursive Self-Aggregation implmented with DSPy"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = ["dspy>=3.1.2"]
+
+[project.scripts]
+recselfagg = "recselfagg.cli:main"
+
+[build-system]
+requires = ["uv-build"]
+build-backend = "uv_build"
